@@ -81,3 +81,24 @@ class Transaction(models.Model):
                 name='amt_should_be_positive'
             ),
         ]
+
+class Match(models.Model):
+    class Status(models.TextChoices):
+        PROPOSED = "proposed"
+        APPROVED = "approved"
+        REJECTED = "rejected"
+
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name="matches")
+    transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE, related_name="matches")
+    line_item = models.ForeignKey(LineItem, on_delete=models.CASCADE, related_name="matches")
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.PROPOSED)
+    reason = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["transaction", "line_item"], name="uniq_match_per_pair"),
+            models.UniqueConstraint(
+                fields=["transaction"], condition=Q(status="approved"), name="one_approved_match_per_txn"
+            ),
+        ]
