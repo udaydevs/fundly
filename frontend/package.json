@@ -10,8 +10,21 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.1",
+    "@mui/icons-material": "^9.5.0",
+    "@mui/material": "^9.5.0",
+    "@tailwindcss/vite": "^4.3.3",
+    "@untitledui/file-icons": "^0.0.9",
+    "@untitledui/icons": "^0.0.23",
+    "@uploadcare/react-uploader": "^1.17.0",
+    "motion": "^13.5.1",
     "react": "^19.3.1",
-    "react-dom": "^19.3.1"
+    "react-aria": "^3.53.1",
+    "react-aria-components": "^1.22.1",
+    "react-dom": "^19.3.1",
+    "tailwind-merge": "^3.7.0",
+    "tailwindcss": "^4.3.3"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
