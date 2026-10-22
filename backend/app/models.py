@@ -35,9 +35,12 @@ class LineItem(models.Model):
 
     class Meta:
           constraints = [
-            models.CheckConstraint(condition=Q(called_amt__gt=0)),
-            models.CheckConstraint(condition=Q(funded_amt__gte=0)),
-            models.CheckConstraint(condition=Q(funded_amot__lte=F("called_amount")))
+            models.CheckConstraint(condition=Q(called_amt__gt=0),
+                                   name="called_amt_should_be_positive"),
+            models.CheckConstraint(condition=Q(funded_amt__gte=0),
+                                   name="funded_amt_should_be_positive"),
+            models.CheckConstraint(condition=Q(funded_amt__lte=F("called_amt")),
+                                   name="amt_should_not be_greater_than_called_amt")
           ]
 
     @property
@@ -75,5 +78,6 @@ class Transaction(models.Model):
         constraints = [
             models.CheckConstraint(
                 condition=(Q(type="credit", amt__gt=0) | Q(type="debit", amt__lt=0)),
+                name='amt_should_be_positive'
             ),
         ]
