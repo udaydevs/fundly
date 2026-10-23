@@ -28,7 +28,7 @@ def run_reconciliation(function, organization, pk):
 def get_transactions(organization):
     return (
         Transaction.objects
-        .filter(organization=organization)
+        .filter(org=organization)
         .prefetch_related(
             Prefetch(
                 "matches",
@@ -63,20 +63,36 @@ class TransactionView(viewsets.ReadOnlyModelViewSet):
         return Transaction.objects.filter(org =org).order_by("-date", "-id")
     
     def list(self, request, *args, **kwargs):
-        response = super().list(request, *args, **kwargs)
+        queryset = self.filter_queryset(self.get_queryset())
+
+        page = self.paginate_queryset(queryset)
+
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            transactions = serializer.data
+        else:
+            serializer = self.get_serializer(queryset, many=True)
+            transactions = serializer.data
+
         counts = (
             Transaction.objects
             .filter(org=request.organization)
             .values("status")
             .annotate(total=Count("id"))
         )
-        response.data["status_counts"] = {
-            item["status"]: item["total"] for item in counts
-        }
-        for transaction_status in Transaction.Status.values:
-            response.data["status_counts"].setdefault(transaction_status, 0)
 
-        return response
+        status_counts = {
+            item["status"]: item["total"]
+            for item in counts
+        }
+
+        for transaction_status in Transaction.Status.values:
+            status_counts.setdefault(transaction_status, 0)
+
+        return Response({
+            "transactions": transactions,
+            "status_counts": status_counts,
+        })
 
     @action(
         detail=False,
@@ -170,8 +186,8 @@ class LineItemViewSet(
     def get_queryset(self):
         line_items = (
             LineItem.objects
-            .filter(organization=self.request.organization)
-            .select_related("capital_call")
+            .filter(org=self.request.organization)
+            .select_related("cap_call")
         )
 
         status_filter = self.request.query_params.get("status")
@@ -185,4 +201,4 @@ class LineItemViewSet(
 
             line_items = line_items.filter(status=status_filter)
 
-        return line_items.order_by("capital_call__number", "id")
+        return line_items.order_by("cap_call__number", "id")

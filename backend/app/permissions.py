@@ -17,7 +17,7 @@ class OrganizationHeaderPerm(BasePermission):
                 }
             )
         try:
-            request.organization = Organization.object.get(slug = slug)
+            request.organization = Organization.objects.get(slug = slug)
         except Organization.DoesNotExist:
             raise NotFound({
                 'err': "Organization does not exist",
