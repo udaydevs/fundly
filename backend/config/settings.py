@@ -123,7 +123,7 @@ USE_I18N = True
 
 USE_TZ = True
 
-
+MAX_IMPORT_BYTES=10 * 1024 * 1024 
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/4.2/howto/static-files/
 

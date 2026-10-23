@@ -1,16 +1,19 @@
 """All the views are here."""
-from re import Match
 
-from django.db.models.aggregates import Count
-from django.http.multipartparser import MultiPartParser
+from django.conf import settings
+from django.db.models import Count, Prefetch
+
+from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
-from rest_framework import viewsets, status, mixins
 from rest_framework.exceptions import APIException, ValidationError
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
-from rest_framework.views import APIView, settings
+from rest_framework.views import APIView
+
+from .models import LineItem, Match, Transaction
 from .serializers import LineItemSerializer, TransactionSerializer
 from .services import check_csv, reconciliation
-from .models import LineItem, Transaction
+
 
 class Conflict(APIException):
     status_code = status.HTTP_409_CONFLICT
@@ -21,9 +24,8 @@ def run_reconciliation(function, organization, pk):
     try:
         return function(organization, pk)
     except Exception as error:
-        raise Exception(str(error))
-    except Exception as error:
-        raise Exception(str(error))
+        raise APIException(str(error))
+
 
 def get_transactions(organization):
     return (
@@ -33,35 +35,35 @@ def get_transactions(organization):
             Prefetch(
                 "matches",
                 queryset=Match.objects.select_related(
-                    "line_item__capital_call"
-                ).order_by("id")
+                    "line_item__cap_call"
+                ).order_by("id"),
             )
         )
     )
 
 
 class OrganizationView(APIView):
-    """
-    Organization view contains the get request which will 
-    check if the organization exist or not.
-    """
     def get(self, request):
-        """Get Organization from the request and return org details"""
         org = request.organization
-        return Response({"slug": org.slug, "name": org.name})
+
+        return Response({
+            "slug": org.slug,
+            "name": org.org_name,
+        })
+
 
 class TransactionView(viewsets.ReadOnlyModelViewSet):
-    """
-    All the data that has been loaded from the csv
-    can be fetched from this view
-    """
     serializer_class = TransactionSerializer
-
 
     def get_queryset(self):
         org = self.request.organization
-        return Transaction.objects.filter(org =org).order_by("-date", "-id")
-    
+
+        return (
+            Transaction.objects
+            .filter(org=org)
+            .order_by("-date", "-id")
+        )
+
     def list(self, request, *args, **kwargs):
         queryset = self.filter_queryset(self.get_queryset())
 
@@ -98,48 +100,81 @@ class TransactionView(viewsets.ReadOnlyModelViewSet):
         detail=False,
         methods=["post"],
         url_path="import",
-        parser_classes=[MultiPartParser]
+        parser_classes=[MultiPartParser, FormParser, JSONParser],
     )
     def import_csv(self, request):
         uploaded_file = request.FILES.get("file")
 
         if not uploaded_file:
-            return Response({
-                "err": "Please upload a CSV file using the 'file' field."
-            }, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {
+                    "detail": (
+                        "Please upload a CSV file using the 'file' field."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        if uploaded_file.size > settings.MAX_IMPORT_BYTES:
-            return Response({"err": "File is too large."},status= status.HTTP_400_BAD_REQUEST)
+        max_import_bytes = getattr(
+            settings,
+            "MAX_IMPORT_BYTES",
+            10 * 1024 * 1024,
+        )
+
+        if uploaded_file.size > max_import_bytes:
+            return Response(
+                {"detail": "File is too large."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not uploaded_file.name.lower().endswith(".csv"):
+            return Response(
+                {"detail": "Only CSV files are allowed."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         try:
             result = check_csv.import_statement(
                 request.organization,
-                uploaded_file.read()
+                uploaded_file.read(),
             )
+
         except check_csv.CsvFormatError as error:
             return Response(
                 {
                     "detail": error.message,
-                    "missing_columns": error.missing_columns
+                    "missing_columns": error.missing_columns,
                 },
-                status=status.HTTP_400_BAD_REQUEST
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
-        return Response(result, status=status.HTTP_200_OK)
+        except ValueError as error:
+            return Response(
+                {"detail": str(error)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response(
+            result,
+            status=status.HTTP_200_OK,
+        )
 
     @action(detail=True, methods=["post"])
     def ignore(self, request, pk=None):
         transaction = run_reconciliation(
             reconciliation.ignore_transaction,
             request.organization,
-            pk
+            pk,
         )
 
-        transaction = get_transactions(request.organization).get(
-            pk=transaction.pk
+        transaction = get_transactions(
+            request.organization
+        ).get(pk=transaction.pk)
+
+        return Response(
+            TransactionSerializer(transaction).data
         )
 
-        return Response(TransactionSerializer(transaction).data)
 
 class MatchViewSet(viewsets.GenericViewSet):
     """Approve or reject proposed transaction matches."""
@@ -150,19 +185,22 @@ class MatchViewSet(viewsets.GenericViewSet):
         )
 
     def respond(self, request, transaction):
-        transaction = get_transactions(request.organization).get(
-            pk=transaction.pk
-        )
-        return Response(TransactionSerializer(transaction).data)
+        transaction = get_transactions(
+            request.organization
+        ).get(pk=transaction.pk)
 
-    # Approve a match
+        return Response(
+            TransactionSerializer(transaction).data
+        )
+
     @action(detail=True, methods=["post"])
     def approve(self, request, pk=None):
         transaction = run_reconciliation(
             reconciliation.approve_match,
             request.organization,
-            pk
+            pk,
         )
+
         return self.respond(request, transaction)
 
     @action(detail=True, methods=["post"])
@@ -170,15 +208,16 @@ class MatchViewSet(viewsets.GenericViewSet):
         transaction = run_reconciliation(
             reconciliation.reject_match,
             request.organization,
-            pk
+            pk,
         )
+
         return self.respond(request, transaction)
 
 
 class LineItemViewSet(
     mixins.ListModelMixin,
     mixins.RetrieveModelMixin,
-    viewsets.GenericViewSet
+    viewsets.GenericViewSet,
 ):
     serializer_class = LineItemSerializer
     pagination_class = None
@@ -195,10 +234,17 @@ class LineItemViewSet(
         if status_filter:
             if status_filter not in LineItem.Status.values:
                 raise ValidationError({
-                    "status": "Invalid status. Choose from: "
-                    + ", ".join(LineItem.Status.values)
+                    "status": (
+                        "Invalid status. Choose from: "
+                        + ", ".join(LineItem.Status.values)
+                    )
                 })
 
-            line_items = line_items.filter(status=status_filter)
+            line_items = line_items.filter(
+                status=status_filter
+            )
 
-        return line_items.order_by("cap_call__number", "id")
+        return line_items.order_by(
+            "cap_call__number",
+            "id",
+        )

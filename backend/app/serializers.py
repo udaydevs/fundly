@@ -10,8 +10,8 @@ class CapitalCallSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 class LineItemSerializer(serializers.ModelSerializer):
-    capital_call = CapitalCallSerializer(read_only=True)
-    amount_remaining = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    cap_call = CapitalCallSerializer(read_only=True)
+    rem_amt = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
 
     class Meta:
         model = LineItem

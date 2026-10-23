@@ -3,14 +3,23 @@ import io
 import re
 from datetime import date
 from decimal import Decimal, InvalidOperation
-
 from django.db import transaction
+from ..models import Transaction
 
-from ..models import Transaction, LineItem, Match, Organization
-from .matching import Candidate, find_matches
+REQUIRED_COLUMNS = [
+    "date",
+    "description",
+    "amount",
+    "type",
+    "reference",
+]
 
+MAX_CSV_SIZE = 10 * 1024 * 1024  # 10 MB
+MAX_DESCRIPTION_LENGTH = 5000
+MAX_REFERENCE_LENGTH = 100
 
-REQUIRED_COLUMNS = ["date", "description", "amount", "type", "reference"]
+# Prevent csv module from rejecting reasonably large fields.
+csv.field_size_limit(1024 * 1024)
 
 
 class CsvFormatError(Exception):
@@ -20,65 +29,123 @@ class CsvFormatError(Exception):
         super().__init__(message)
 
 
-def decode_csv(data):
+def decode_csv(data: bytes) -> str:
     try:
         return data.decode("utf-8-sig")
     except UnicodeDecodeError:
         return data.decode("cp1252", errors="replace")
 
-def parse_amount(value):
+
+def parse_amount(value: str) -> Decimal:
     value = value.strip()
+
     if not value:
         raise ValueError("Amount is required")
-    if not re.fullmatch(r"[+-]?(\d{1,3}(,\d{3})+|\d+)(\.\d+)?", value):
+
+    # Examples accepted:
+    # 100
+    # -100
+    # +100
+    # 1,000
+    # -1,000.50
+    # 100.25
+    if not re.fullmatch(
+        r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?",
+        value,
+    ):
         raise ValueError(f"Invalid amount: {value}")
+
     try:
         amount = Decimal(value.replace(",", ""))
     except InvalidOperation:
         raise ValueError(f"Invalid amount: {value}")
+
     if amount == 0:
         raise ValueError("Amount cannot be zero")
-    if amount != amount.quantize(Decimal("0.01")):
-        raise ValueError("Amount can have at most 2 decimal places")
+
     if abs(amount) >= Decimal("1000000000000"):
         raise ValueError("Amount is too large")
+
     return amount.quantize(Decimal("0.01"))
+
 
 def validate_row(row, line_number):
     errors = []
-    try:
-        transaction_date = date.fromisoformat(row["date"])
-        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", row["date"]):
-            raise ValueError
-    except ValueError:
+
+    # -------------------------
+    # Date
+    # -------------------------
+    date_value = row["date"].strip()
+
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_value):
+        errors.append("Date must be in YYYY-MM-DD format")
         transaction_date = None
-        errors.append("Date must be a valid YYYY-MM-DD date")
-    description = row["description"]
+    else:
+        try:
+            transaction_date = date.fromisoformat(date_value)
+        except ValueError:
+            errors.append("Date must be a valid YYYY-MM-DD date")
+            transaction_date = None
+
+    # -------------------------
+    # Description
+    # -------------------------
+    description = row["description"].strip()
+
     if not description:
         errors.append("Description is required")
+    elif len(description) > MAX_DESCRIPTION_LENGTH:
+        errors.append(
+            f"Description cannot exceed {MAX_DESCRIPTION_LENGTH} characters"
+        )
+
+    # -------------------------
+    # Amount
+    # -------------------------
     try:
         amount = parse_amount(row["amount"])
     except ValueError as error:
         amount = None
         errors.append(str(error))
-    transaction_type = row["type"].lower()
-    if transaction_type not in ["credit", "debit"]:
+
+    # -------------------------
+    # Type
+    # -------------------------
+    transaction_type = row["type"].strip().lower()
+
+    if transaction_type not in {
+        "credit",
+        "debit",
+    }:
         errors.append("Type must be credit or debit")
+
+    # Credit must be positive
+    # Debit must be negative
     if amount is not None:
-        if transaction_type == "credit" and amount < 0:
+        if transaction_type == "credit" and amount <= 0:
             errors.append("Credit amount must be positive")
-        elif transaction_type == "debit" and amount > 0:
+
+        elif transaction_type == "debit" and amount >= 0:
             errors.append("Debit amount must be negative")
-    reference = row["reference"]
+
+    # -------------------------
+    # Reference
+    # -------------------------
+    reference = row["reference"].strip()
+
     if not reference:
         errors.append("Reference is required")
-    elif len(reference) > 100:
-        errors.append("Reference cannot exceed 100 characters")
+    elif len(reference) > MAX_REFERENCE_LENGTH:
+        errors.append(
+            f"Reference cannot exceed {MAX_REFERENCE_LENGTH} characters"
+        )
+
     if errors:
         return None, {
             "line": line_number,
-            "message": "; ".join(errors)
+            "message": "; ".join(errors),
         }
+
     return {
         "date": transaction_date,
         "description": description,
@@ -88,146 +155,156 @@ def validate_row(row, line_number):
         "line": line_number,
     }, None
 
-def parse_csv(data):
+
+def parse_csv(data: bytes):
+    # -------------------------
+    # File size check
+    # -------------------------
+    if not data:
+        raise CsvFormatError(
+            "CSV file is empty",
+            REQUIRED_COLUMNS,
+        )
+
+    if len(data) > MAX_CSV_SIZE:
+        raise CsvFormatError(
+            "CSV file cannot exceed 10 MB",
+        )
+
+    # -------------------------
+    # Decode
+    # -------------------------
     text = decode_csv(data)
+
+    if not text.strip():
+        raise CsvFormatError(
+            "CSV file is empty",
+            REQUIRED_COLUMNS,
+        )
+
     reader = csv.reader(io.StringIO(text))
+
+    # -------------------------
+    # Header
+    # -------------------------
     header = next(reader, None)
-    if not header or not any(column.strip() for column in header):
-        raise CsvFormatError("CSV file is empty", REQUIRED_COLUMNS)
+
+    if not header:
+        raise CsvFormatError(
+            "CSV file is empty",
+            REQUIRED_COLUMNS,
+        )
+
     columns = [column.strip().lower() for column in header]
+
+    if not any(columns):
+        raise CsvFormatError(
+            "CSV header is empty",
+            REQUIRED_COLUMNS,
+        )
+
+    # -------------------------
+    # Duplicate columns
+    # -------------------------
+    duplicates = {
+        column
+        for column in columns
+        if column and columns.count(column) > 1
+    }
+
+    if duplicates:
+        raise CsvFormatError(
+            f"Duplicate columns: {', '.join(sorted(duplicates))}"
+        )
+
+    # -------------------------
+    # Required columns
+    # -------------------------
     missing = [
-        column for column in REQUIRED_COLUMNS
+        column
+        for column in REQUIRED_COLUMNS
         if column not in columns
     ]
+
     if missing:
         raise CsvFormatError(
             f"Missing columns: {', '.join(missing)}",
-            missing
+            missing,
         )
+
+    # -------------------------
+    # Column indexes
+    # -------------------------
     indexes = {
         column: columns.index(column)
         for column in REQUIRED_COLUMNS
     }
+
     valid_rows = []
     errors = []
+
+    # -------------------------
+    # Rows
+    # -------------------------
     for line_number, record in enumerate(reader, start=2):
-        if not any(cell.strip() for cell in record):
+
+        # Ignore completely empty rows
+        if not record or not any(cell.strip() for cell in record):
             continue
+
+        # Every row must have exactly the same
+        # number of columns as the header.
         if len(record) != len(columns):
             errors.append({
                 "line": line_number,
-                "message": "Incorrect number of columns"
+                "message": (
+                    f"Expected {len(columns)} columns, "
+                    f"got {len(record)}"
+                ),
             })
             continue
+
         row_data = {
             column: record[index].strip()
             for column, index in indexes.items()
         }
-        valid_row, error = validate_row(row_data, line_number)
+
+        valid_row, error = validate_row(
+            row_data,
+            line_number,
+        )
+
         if error:
             errors.append(error)
         else:
             valid_rows.append(valid_row)
+
     return valid_rows, errors
-
-def get_candidates(organization):
-    line_items = (
-        LineItem.objects
-        .filter(organization=organization)
-        .select_related("capital_call")
-        .order_by("capital_call__call_date", "id")
-    )
-    candidates = []
-    for item in line_items:
-        if item.amount_remaining > 0:
-            candidates.append(
-                Candidate.build(
-                    item.id,
-                    item.reference,
-                    item.investor_name,
-                    item.capital_call.call_date,
-                    item.amount_remaining,
-                )
-            )
-    return candidates
-
-def import_statement(organization: Organization, data: bytes):
+def import_statement(organization, data):
     rows, errors = parse_csv(data)
-    imported_transactions = []
-    duplicate_details = []
+
+    if errors:
+        return {
+            "imported": 0,
+            "errors": errors,
+        }
+
+    imported = 0
+
     with transaction.atomic():
-        Organization.objects.select_for_update().get(pk=organization.pk)
-        existing_references = set(
-            Transaction.objects
-            .filter(organization=organization)
-            .values_list("bank_reference", flat=True)
-        )
-        candidates = get_candidates(organization)
-        seen_references = set()
         for row in rows:
-            reference = row["reference"]
-            if reference in existing_references or reference in seen_references:
-                duplicate_details.append({
-                    "line": row["line"],
-                    "reference": reference,
-                })
-                continue
-            seen_references.add(reference)
-            transaction_obj = Transaction(
-                organization=organization,
+            Transaction.objects.create(
+                org=organization,
                 date=row["date"],
-                description=row["description"],
-                amount=row["amount"],
+                descp=row["description"],
+                amt=row["amount"],
                 type=row["type"],
-                bank_reference=reference,
-                source_line=row["line"],
+                bank_ref=row["reference"],
+                status=Transaction.Status.NEEDS_REVIEW,
             )
-            if row["type"] == Transaction.Type.DEBIT:
-                transaction_obj.status = Transaction.Status.IGNORED
-                transaction_obj.reason = (
-                    "Debit (money out) cannot pay a capital call"
-                )
-                outcome = None
-            else:
-                outcome = find_matches(
-                    row["date"],
-                    row["amount"],
-                    row["description"],
-                    reference,
-                    candidates,
-                )
-                transaction_obj.status = outcome.status
-                transaction_obj.reason = outcome.reason
-            imported_transactions.append((transaction_obj, outcome))
-        Transaction.objects.bulk_create(
-            [item[0] for item in imported_transactions],
-            batch_size=500,
-        )
-        matches = []
-        for transaction_obj, outcome in imported_transactions:
-            if not outcome:
-                continue
-            for proposal in outcome.proposals:
-                matches.append(
-                    Match(
-                        organization=organization,
-                        transaction=transaction_obj,
-                        line_item_id=proposal.line_item_id,
-                        status=Match.Status.PROPOSED,
-                        reason=proposal.reason,
-                    )
-                )
-        Match.objects.bulk_create(matches, batch_size=500)
-    breakdown = {
-        status.value: 0
-        for status in Transaction.Status
-    }
-    for transaction_obj, _ in imported_transactions:
-        breakdown[transaction_obj.status] += 1
+            imported += 1
+
     return {
-        "imported": len(imported_transactions),
-        "duplicates": len(duplicate_details),
-        "duplicate_details": duplicate_details,
-        "errors": errors,
-        "breakdown": breakdown,
+        "imported": imported,
+        "errors": [],
     }
